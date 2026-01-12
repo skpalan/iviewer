@@ -18,6 +18,8 @@ from .viewer import (
     CHANNEL_COLORS,
 )
 
+from .reader import get_reader, read_puncta_csv
+
 __all__ = [
     "__version__",
     "load_reference_image",
@@ -25,4 +27,6 @@ __all__ = [
     "add_puncta_images",
     "add_puncta_locations",
     "CHANNEL_COLORS",
+    "get_reader",
+    "read_puncta_csv",
 ]

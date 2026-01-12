@@ -1,0 +1,444 @@
+#!/usr/bin/env python
+"""
+Custom napari readers for 3D TIFF images and puncta CSV files.
+
+This module provides napari reader plugins that properly handle:
+- 3D TIFF images with correct dimension ordering
+- Puncta location CSV files as points layers
+
+Common dimension orderings for TIFF:
+- (Z, Y, X): Standard 3D volume
+- (Z, C, Y, X): 3D multichannel
+- (C, Z, Y, X): Alternative multichannel
+- (T, Y, X): Time series
+"""
+
+from pathlib import Path
+from typing import Callable, List, Optional, Tuple, Union
+
+import numpy as np
+import pandas as pd
+from tifffile import TiffFile, imread
+
+# Channel color mapping (same as viewer.py)
+CHANNEL_COLORS = {"Cy3": "yellow", "Cy5": "red", "mCherry": "magenta"}
+
+
+def get_reader(path: Union[str, List[str]]) -> Optional[Callable]:
+    """Return reader function if path is a supported file (TIFF or CSV).
+    
+    Parameters
+    ----------
+    path : str or list of str
+        Path(s) to file(s).
+        
+    Returns
+    -------
+    callable or None
+        Reader function if path is supported, None otherwise.
+    """
+    if isinstance(path, list):
+        # Handle multiple files - check if all are same type
+        if all(_is_supported_tiff(p) for p in path):
+            return read_tiff_stack
+        if all(_is_puncta_csv(p) for p in path):
+            return read_puncta_csv
+        return None
+    
+    if _is_supported_tiff(path):
+        return read_tiff_stack
+    
+    if _is_puncta_csv(path):
+        return read_puncta_csv
+    
+    return None
+
+
+def _is_supported_tiff(path: str) -> bool:
+    """Check if path is a supported TIFF file."""
+    path = Path(path)
+    return path.suffix.lower() in {'.tif', '.tiff'}
+
+
+def _is_puncta_csv(path: str) -> bool:
+    """Check if path is a puncta location CSV file."""
+    path = Path(path)
+    if path.suffix.lower() != '.csv':
+        return False
+    
+    # Quick check: read first line to verify it has expected columns
+    try:
+        with open(path, 'r') as f:
+            header = f.readline().strip().lower()
+            # Must have x, y, z columns for spatial data
+            return 'x' in header and 'y' in header and 'z' in header
+    except Exception:
+        return False
+
+
+# Default channel names for common microscopy setups
+DEFAULT_CHANNEL_NAMES = ['DAPI', 'GFP', 'Cy3', 'Cy5', 'mCherry', 'BFP', 'YFP', 'RFP']
+
+
+def _get_channel_names(n_channels: int) -> List[str]:
+    """Get channel names for a multichannel image.
+    
+    Parameters
+    ----------
+    n_channels : int
+        Number of channels in the image.
+        
+    Returns
+    -------
+    list of str
+        List of channel names.
+    """
+    if n_channels <= len(DEFAULT_CHANNEL_NAMES):
+        return DEFAULT_CHANNEL_NAMES[:n_channels]
+    else:
+        # For more channels than defaults, use Ch1, Ch2, etc. for extras
+        names = DEFAULT_CHANNEL_NAMES.copy()
+        for i in range(len(DEFAULT_CHANNEL_NAMES), n_channels):
+            names.append(f'Ch{i + 1}')
+        return names
+
+
+def _detect_dimension_order(tif: TiffFile, data: np.ndarray) -> Tuple[str, dict]:
+    """Detect dimension order from TIFF metadata and data shape.
+    
+    Parameters
+    ----------
+    tif : TiffFile
+        Open TiffFile object with metadata.
+    data : np.ndarray
+        Image data array.
+        
+    Returns
+    -------
+    tuple of (str, dict)
+        Tuple of (axis_labels, metadata) where axis_labels is a string like 'ZYX'
+        and metadata contains information about the detection.
+    """
+    shape = data.shape
+    ndim = data.ndim
+    metadata = {'original_shape': shape, 'detection_method': None}
+    
+    # Try to get axis information from tifffile
+    # tifffile stores axis info in series[0].axes
+    axes = None
+    if tif.series:
+        axes = tif.series[0].axes
+        if axes:
+            metadata['tiff_axes'] = axes
+            metadata['detection_method'] = 'tiff_metadata'
+            return axes, metadata
+    
+    # Check ImageJ metadata
+    if tif.imagej_metadata:
+        ij_meta = tif.imagej_metadata
+        metadata['imagej_metadata'] = ij_meta
+        
+        # ImageJ stores dimension info
+        n_slices = ij_meta.get('slices', 1)
+        n_channels = ij_meta.get('channels', 1)
+        n_frames = ij_meta.get('frames', 1)
+        
+        if n_slices > 1 or n_channels > 1 or n_frames > 1:
+            # Build axis string based on ImageJ metadata
+            axes_parts = []
+            if n_frames > 1:
+                axes_parts.append('T')
+            if n_channels > 1:
+                axes_parts.append('C')
+            if n_slices > 1:
+                axes_parts.append('Z')
+            axes_parts.extend(['Y', 'X'])
+            
+            axes = ''.join(axes_parts)
+            metadata['detection_method'] = 'imagej_metadata'
+            return axes, metadata
+    
+    # Heuristic detection based on shape
+    metadata['detection_method'] = 'heuristic'
+    
+    if ndim == 2:
+        return 'YX', metadata
+    
+    elif ndim == 3:
+        # For 3D images, determine if first dim is Z, C, or T
+        # Heuristic: Z typically has more slices than channels
+        # Channels are usually small (1-4), Z can be large (10-1000+)
+        first_dim = shape[0]
+        
+        # If first dimension is small (<=4), might be channels
+        # But for 3D TIFF, assume ZYX by default (most common for microscopy)
+        if first_dim <= 4 and shape[1] > first_dim and shape[2] > first_dim:
+            # Could be CYX, but we'll still assume ZYX and let user adjust
+            # For spatial data, ZYX is more common
+            pass
+        
+        # Default assumption: ZYX (most common for 3D microscopy data)
+        return 'ZYX', metadata
+    
+    elif ndim == 4:
+        # 4D: could be ZCYX, CZYX, TZYX, TCYX
+        first_dim = shape[0]
+        second_dim = shape[1]
+        
+        # Heuristic: if second dim is small (<=4), likely ZCYX
+        # If first dim is small (<=4), likely CZYX
+        if second_dim <= 4:
+            return 'ZCYX', metadata
+        elif first_dim <= 4:
+            return 'CZYX', metadata
+        else:
+            # Default to TZYX for large first two dims
+            return 'TZYX', metadata
+    
+    elif ndim == 5:
+        # 5D: TZCYX or TCZYX
+        if shape[2] <= 4:
+            return 'TZCYX', metadata
+        else:
+            return 'TCZYX', metadata
+    
+    # Fallback: just use dimension indices
+    return ''.join([f'D{i}' for i in range(ndim - 2)] + ['Y', 'X']), metadata
+
+
+def _reorder_to_zyx(data: np.ndarray, axes: str) -> Tuple[np.ndarray, dict]:
+    """Reorder data to ensure ZYX order for 3D volumes.
+    
+    Parameters
+    ----------
+    data : np.ndarray
+        Image data.
+    axes : str
+        Current axis labels (e.g., 'ZYX', 'XYZ', 'ZCY X').
+        
+    Returns
+    -------
+    tuple of (np.ndarray, dict)
+        Reordered data and layer kwargs for napari.
+    """
+    axes = axes.upper().replace(' ', '')
+    shape = data.shape
+    layer_kwargs = {}
+    
+    # Handle common reorderings
+    if data.ndim == 3:
+        if axes == 'ZYX':
+            # Already correct
+            return data, layer_kwargs
+        elif axes == 'YXZ':
+            # Transpose to ZYX
+            return np.transpose(data, (2, 0, 1)), layer_kwargs
+        elif axes == 'XYZ':
+            # Transpose to ZYX
+            return np.transpose(data, (2, 1, 0)), layer_kwargs
+        elif axes == 'ZXY':
+            # Transpose to ZYX
+            return np.transpose(data, (0, 2, 1)), layer_kwargs
+        elif axes == 'CYX':
+            # Multichannel 2D - let napari handle as-is
+            layer_kwargs['channel_axis'] = 0
+            return data, layer_kwargs
+    
+    elif data.ndim == 4:
+        if axes == 'ZCYX':
+            # Split channels
+            layer_kwargs['channel_axis'] = 1
+            return data, layer_kwargs
+        elif axes == 'CZYX':
+            # Channel first - reorder to ZCYX
+            data = np.transpose(data, (1, 0, 2, 3))
+            layer_kwargs['channel_axis'] = 1
+            return data, layer_kwargs
+        elif axes == 'ZYXC':
+            # Channel last - reorder to ZCYX
+            data = np.transpose(data, (0, 3, 1, 2))
+            layer_kwargs['channel_axis'] = 1
+            return data, layer_kwargs
+        elif axes == 'TZYX':
+            # Time series - no channel axis
+            return data, layer_kwargs
+    
+    # Default: return as-is
+    return data, layer_kwargs
+
+
+def read_tiff_stack(path: Union[str, List[str]]) -> List[Tuple]:
+    """Read TIFF file(s) and return napari layer data.
+    
+    Parameters
+    ----------
+    path : str or list of str
+        Path(s) to TIFF file(s).
+        
+    Returns
+    -------
+    list of tuple
+        List of (data, kwargs, layer_type) tuples for napari.
+    """
+    if isinstance(path, str):
+        paths = [path]
+    else:
+        paths = path
+    
+    layers = []
+    
+    for file_path in paths:
+        file_path = Path(file_path)
+        name = file_path.stem
+        
+        # Read with tifffile to get metadata
+        with TiffFile(file_path) as tif:
+            data = tif.asarray()
+            axes, detection_meta = _detect_dimension_order(tif, data)
+        
+        # Print detection info for debugging
+        print(f"Loading: {name}")
+        print(f"  Shape: {data.shape}")
+        print(f"  Detected axes: {axes}")
+        print(f"  Detection method: {detection_meta.get('detection_method', 'unknown')}")
+        
+        # Reorder data if needed
+        data, layer_kwargs = _reorder_to_zyx(data, axes)
+        
+        if data.shape != detection_meta['original_shape']:
+            print(f"  Reordered shape: {data.shape}")
+        
+        # Set layer name(s) - format: {channel_name}-{filename}
+        if 'channel_axis' in layer_kwargs:
+            # Multichannel image - provide names for each channel
+            n_channels = data.shape[layer_kwargs['channel_axis']]
+            channel_names = _get_channel_names(n_channels)
+            layer_kwargs['name'] = [f"{ch}-{name}" for ch in channel_names]
+            print(f"  Channels: {channel_names}")
+        else:
+            layer_kwargs['name'] = name
+        
+        # Add blending for better visualization
+        layer_kwargs['blending'] = 'additive'
+        
+        layers.append((data, layer_kwargs, 'image'))
+    
+    return layers
+
+
+def _parse_puncta_filename(name: str) -> Tuple[Optional[str], Optional[str]]:
+    """Parse round and channel info from puncta CSV filename.
+    
+    Expected filename patterns:
+    - Thr_0p00174_Gel20251024_round08_brain08_channel-Cy3 Nar_regis
+    - {prefix}_{round_id}_{...}_channel-{channel}_...
+    
+    Parameters
+    ----------
+    name : str
+        Filename stem (without extension).
+        
+    Returns
+    -------
+    tuple of (str or None, str or None)
+        (round_id, channel) extracted from filename, or (None, None) if parsing fails.
+    """
+    parts = name.split("_")
+    round_id = None
+    channel = None
+    
+    # Find round ID (e.g., "round08")
+    for part in parts:
+        if part.startswith("round"):
+            round_id = part
+            break
+    
+    # Find channel (after "channel-")
+    if "channel-" in name:
+        try:
+            channel = name.split("channel-")[1].split("_")[0]
+        except (IndexError, ValueError):
+            pass
+    
+    return round_id, channel
+
+
+def read_puncta_csv(path: Union[str, List[str]]) -> List[Tuple]:
+    """Read puncta location CSV file(s) and return napari points layer data.
+    
+    Parameters
+    ----------
+    path : str or list of str
+        Path(s) to CSV file(s).
+        
+    Returns
+    -------
+    list of tuple
+        List of (data, kwargs, layer_type) tuples for napari.
+    """
+    if isinstance(path, str):
+        paths = [path]
+    else:
+        paths = path
+    
+    layers = []
+    
+    for file_path in paths:
+        file_path = Path(file_path)
+        name = file_path.stem
+        
+        # Read CSV file
+        try:
+            df = pd.read_csv(file_path)
+        except Exception as e:
+            print(f"Error reading {name}: {e}")
+            continue
+        
+        if len(df) == 0:
+            print(f"Skipping {name}: empty file")
+            continue
+        
+        # Check for required columns
+        required_cols = ['x', 'y', 'z']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            print(f"Skipping {name}: missing columns {missing_cols}")
+            continue
+        
+        # Extract coordinates (napari expects z, y, x order)
+        coords = df[["z", "y", "x"]].values.copy()
+        
+        # Parse filename to get round and channel info
+        round_id, channel = _parse_puncta_filename(name)
+        
+        # Determine color based on channel
+        if channel:
+            channel_base = channel.replace(" Nar", "")
+            color = CHANNEL_COLORS.get(channel_base, "white")
+        else:
+            color = "white"
+        
+        # Build layer name
+        if round_id and channel:
+            layer_name = f"Loc {round_id} {channel}"
+        else:
+            layer_name = f"Loc {name}"
+        
+        # Print loading info
+        print(f"Loading: {name}")
+        print(f"  Points: {len(df)}")
+        if round_id:
+            print(f"  Round: {round_id}")
+        if channel:
+            print(f"  Channel: {channel} (color: {color})")
+        
+        layer_kwargs = {
+            'name': layer_name,
+            'face_color': color,
+            'size': 3,
+            'blending': 'translucent',
+        }
+        
+        layers.append((coords, layer_kwargs, 'points'))
+    
+    return layers

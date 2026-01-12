@@ -14,11 +14,12 @@ Usage:
 
 The data directory should contain three subdirectories:
     - segmentation/: Reference images and cell masks
-    - regis_puncta_img/: Registered puncta images
-    - regis_puncta_loc/pixel/: Puncta location CSVs
+    - puncta_img/: Registered puncta images
+    - puncta_loc/pixel/: Puncta location CSVs
 """
 
 import argparse
+import os
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +27,20 @@ import pandas as pd
 from tifffile import imread
 import napari
 from napari_orthogonal_views.ortho_view_manager import show_orthogonal_views
+
+
+def _force_exit_on_close():
+    """Force process exit when Qt application quits.
+    
+    This handles cases where napari or plugins leave threads running
+    that prevent the process from exiting cleanly.
+    """
+    from napari._qt.qt_main_window import _QtMainWindow
+    from qtpy.QtWidgets import QApplication
+    
+    app = QApplication.instance()
+    if app is not None:
+        app.aboutToQuit.connect(lambda: os._exit(0))
 
 # Channel color mapping
 CHANNEL_COLORS = {"Cy3": "yellow", "Cy5": "red", "mCherry": "magenta"}
@@ -202,8 +217,8 @@ def run_viewer():
         epilog="""
 The data directory should contain three subdirectories:
   - segmentation/: Reference images and cell masks
-  - regis_puncta_img/: Registered puncta images  
-  - regis_puncta_loc/pixel/: Puncta location CSVs
+  - puncta_img/: Registered puncta images  
+  - puncta_loc/pixel/: Puncta location CSVs
         """,
     )
     parser.add_argument(
@@ -211,7 +226,7 @@ The data directory should contain three subdirectories:
         type=str,
         required=False,
         default=None,
-        help="Path to data directory containing segmentation, regis_puncta_img, and regis_puncta_loc subdirectories. If not provided, starts an empty viewer.",
+        help="Path to data directory containing segmentation, puncta_img, and puncta_loc subdirectories. If not provided, starts an empty viewer.",
     )
     parser.add_argument(
         "--ortho",
@@ -252,6 +267,8 @@ The data directory should contain three subdirectories:
         
         if args.ortho:
             show_orthogonal_views(viewer)
+        
+        _force_exit_on_close()
         napari.run()
         return
     
@@ -261,11 +278,11 @@ The data directory should contain three subdirectories:
         raise FileNotFoundError(f"Data directory not found: {data_dir}")
     
     seg_dir = data_dir / "segmentation"
-    puncta_img_dir = data_dir / "regis_puncta_img"
-    puncta_loc_dir = data_dir / "regis_puncta_loc" / "pixel"
+    puncta_img_dir = data_dir / "puncta_img"
+    puncta_loc_dir = data_dir / "puncta_loc" / "pixel"
     
     # Validate directories exist
-    for dir_path, name in [(seg_dir, "segmentation"), (puncta_img_dir, "regis_puncta_img")]:
+    for dir_path, name in [(seg_dir, "segmentation"), (puncta_img_dir, "puncta_img")]:
         if not dir_path.exists():
             raise FileNotFoundError(f"{name} directory not found: {dir_path}")
     
@@ -333,4 +350,5 @@ The data directory should contain three subdirectories:
     print("=" * 50)
     
     # Start the napari event loop
+    _force_exit_on_close()
     napari.run()

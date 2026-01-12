@@ -38,5 +38,11 @@ iviewer = "iviewer.cli:main"
 [project.urls]
 Homepage = "https://github.com/alanliu/iviewer"
 
+[project.entry-points."napari.manifest"]
+iviewer = "iviewer:napari.yaml"
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+iviewer = ["napari.yaml"]
