@@ -16,16 +16,17 @@ Common dimension orderings for TIFF:
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple, Union
 
+import imageio.v3 as iio
 import numpy as np
 import pandas as pd
-from tifffile import TiffFile, imread
+from tifffile import TiffFile, imread as tiff_imread
 
 # Channel color mapping (same as viewer.py)
 CHANNEL_COLORS = {"Cy3": "yellow", "Cy5": "red", "mCherry": "magenta"}
 
 
 def get_reader(path: Union[str, List[str]]) -> Optional[Callable]:
-    """Return reader function if path is a supported file (TIFF or CSV).
+    """Return reader function if path is a supported file (TIFF, PNG, or CSV).
     
     Parameters
     ----------
@@ -39,13 +40,19 @@ def get_reader(path: Union[str, List[str]]) -> Optional[Callable]:
     """
     if isinstance(path, list):
         # Handle multiple files - check if all are same type
-        if all(_is_supported_tiff(p) for p in path):
+        if all(_is_mask_file(p) for p in path):
+            return read_mask
+        if all(_is_supported_image(p) for p in path):
             return read_tiff_stack
         if all(_is_puncta_csv(p) for p in path):
             return read_puncta_csv
         return None
     
-    if _is_supported_tiff(path):
+    # Check mask files first (more specific than general image)
+    if _is_mask_file(path):
+        return read_mask
+    
+    if _is_supported_image(path):
         return read_tiff_stack
     
     if _is_puncta_csv(path):
@@ -54,10 +61,23 @@ def get_reader(path: Union[str, List[str]]) -> Optional[Callable]:
     return None
 
 
-def _is_supported_tiff(path: str) -> bool:
-    """Check if path is a supported TIFF file."""
+def _is_supported_image(path: str) -> bool:
+    """Check if path is a supported image file (TIFF or PNG)."""
     path = Path(path)
-    return path.suffix.lower() in {'.tif', '.tiff'}
+    return path.suffix.lower() in {'.tif', '.tiff', '.png'}
+
+
+def _is_mask_file(path: str) -> bool:
+    """Check if path is a segmentation mask file.
+    
+    A file is considered a mask if:
+    - It's a TIFF or PNG file
+    - Its filename contains 'mask' (case-insensitive)
+    """
+    path = Path(path)
+    if path.suffix.lower() not in {'.tif', '.tiff', '.png'}:
+        return False
+    return 'mask' in path.stem.lower()
 
 
 def _is_puncta_csv(path: str) -> bool:
@@ -440,5 +460,62 @@ def read_puncta_csv(path: Union[str, List[str]]) -> List[Tuple]:
         }
         
         layers.append((coords, layer_kwargs, 'points'))
+    
+    return layers
+
+
+def read_mask(path: Union[str, List[str]]) -> List[Tuple]:
+    """Read segmentation mask file(s) and return napari labels layer data.
+    
+    Parameters
+    ----------
+    path : str or list of str
+        Path(s) to mask file(s) (TIFF or PNG with 'mask' in filename).
+        
+    Returns
+    -------
+    list of tuple
+        List of (data, kwargs, layer_type) tuples for napari.
+    """
+    if isinstance(path, str):
+        paths = [path]
+    else:
+        paths = path
+    
+    layers = []
+    
+    for file_path in paths:
+        file_path = Path(file_path)
+        name = file_path.stem
+        suffix = file_path.suffix.lower()
+        
+        # Read the mask file
+        try:
+            if suffix in {'.tif', '.tiff'}:
+                with TiffFile(file_path) as tif:
+                    data = tif.asarray()
+            else:  # PNG
+                data = iio.imread(file_path)
+        except Exception as e:
+            print(f"Error reading mask {name}: {e}")
+            continue
+        
+        # Ensure integer type for labels
+        if not np.issubdtype(data.dtype, np.integer):
+            data = data.astype(np.int32)
+        
+        # Count unique labels (excluding background 0)
+        n_labels = len(np.unique(data)) - 1 if 0 in data else len(np.unique(data))
+        
+        print(f"Loading mask: {name}")
+        print(f"  Shape: {data.shape}")
+        print(f"  Labels: {n_labels}")
+        
+        layer_kwargs = {
+            'name': name,
+            'opacity': 0.5,
+        }
+        
+        layers.append((data, layer_kwargs, 'labels'))
     
     return layers

@@ -9,9 +9,10 @@ contributions:
       filename_patterns:
         - "*.tif"
         - "*.tiff"
+        - "*.png"
         - "*.csv"
 
   commands:
     - id: iviewer.get_reader
       python_name: iviewer.reader:get_reader
-      title: Read TIFF and puncta CSV files with proper handling
+      title: Read TIFF, PNG masks, and puncta CSV files
