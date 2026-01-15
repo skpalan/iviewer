@@ -10,9 +10,12 @@ contributions:
         - "*.tif"
         - "*.tiff"
         - "*.png"
+        - "*.h5"
+        - "*.hdf5"
+        - "*.nd2"
         - "*.csv"
 
   commands:
     - id: iviewer.get_reader
       python_name: iviewer.reader:get_reader
-      title: Read TIFF, PNG masks, and puncta CSV files
+      title: Read TIFF, PNG, H5, ND2, and CSV files

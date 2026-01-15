@@ -30,6 +30,8 @@ dependencies = [
     "pandas",
     "tifffile",
     "imageio",
+    "h5py",
+    "nd2",
     "PyOpenGL",
 ]
 

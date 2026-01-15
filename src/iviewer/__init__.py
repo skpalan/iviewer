@@ -18,7 +18,7 @@ from .viewer import (
     CHANNEL_COLORS,
 )
 
-from .reader import get_reader, read_puncta_csv, read_mask
+from .reader import get_reader, read_puncta_csv, read_mask, read_h5, read_nd2
 
 __all__ = [
     "__version__",
@@ -30,4 +30,6 @@ __all__ = [
     "get_reader",
     "read_puncta_csv",
     "read_mask",
+    "read_h5",
+    "read_nd2",
 ]

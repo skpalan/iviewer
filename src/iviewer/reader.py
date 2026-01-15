@@ -13,20 +13,31 @@ Common dimension orderings for TIFF:
 - (T, Y, X): Time series
 """
 
+from collections import defaultdict
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
+import h5py
 import imageio.v3 as iio
+import nd2
 import numpy as np
 import pandas as pd
 from tifffile import TiffFile, imread as tiff_imread
 
-# Channel color mapping (same as viewer.py)
-CHANNEL_COLORS = {"Cy3": "yellow", "Cy5": "red", "mCherry": "magenta"}
+# Channel color mapping for microscopy channels
+CHANNEL_COLORS = {
+    "Cy3": "yellow",
+    "Cy5": "red",
+    "mCherry": "magenta",
+    "DAPI": "blue",
+    "GFP": "green",
+    "FITC": "green",
+    "FITC-GFP": "green",
+}
 
 
 def get_reader(path: Union[str, List[str]]) -> Optional[Callable]:
-    """Return reader function if path is a supported file (TIFF, PNG, or CSV).
+    """Return reader function if path is a supported file (TIFF, PNG, H5, ND2, or CSV).
     
     Parameters
     ----------
@@ -42,6 +53,10 @@ def get_reader(path: Union[str, List[str]]) -> Optional[Callable]:
         # Handle multiple files - check if all are same type
         if all(_is_mask_file(p) for p in path):
             return read_mask
+        if all(_is_nd2_file(p) for p in path):
+            return read_nd2
+        if all(_is_h5_file(p) for p in path):
+            return read_h5
         if all(_is_supported_image(p) for p in path):
             return read_tiff_stack
         if all(_is_puncta_csv(p) for p in path):
@@ -51,6 +66,12 @@ def get_reader(path: Union[str, List[str]]) -> Optional[Callable]:
     # Check mask files first (more specific than general image)
     if _is_mask_file(path):
         return read_mask
+    
+    if _is_nd2_file(path):
+        return read_nd2
+    
+    if _is_h5_file(path):
+        return read_h5
     
     if _is_supported_image(path):
         return read_tiff_stack
@@ -78,6 +99,18 @@ def _is_mask_file(path: str) -> bool:
     if path.suffix.lower() not in {'.tif', '.tiff', '.png'}:
         return False
     return 'mask' in path.stem.lower()
+
+
+def _is_h5_file(path: str) -> bool:
+    """Check if path is an HDF5 file."""
+    path = Path(path)
+    return path.suffix.lower() in {'.h5', '.hdf5'}
+
+
+def _is_nd2_file(path: str) -> bool:
+    """Check if path is a Nikon ND2 file."""
+    path = Path(path)
+    return path.suffix.lower() == '.nd2'
 
 
 def _is_puncta_csv(path: str) -> bool:
@@ -517,5 +550,191 @@ def read_mask(path: Union[str, List[str]]) -> List[Tuple]:
         }
         
         layers.append((data, layer_kwargs, 'labels'))
+    
+    return layers
+
+
+def _parse_h5_filename(name: str) -> Optional[str]:
+    """Parse channel info from H5 filename.
+    
+    Expected filename pattern:
+    - Gel20260109_round01_brain01_channel-DAPI
+    
+    Parameters
+    ----------
+    name : str
+        Filename stem (without extension).
+        
+    Returns
+    -------
+    str or None
+        Channel name extracted from filename, or None if parsing fails.
+    """
+    if "channel-" in name:
+        try:
+            return name.split("channel-")[1].split("_")[0]
+        except (IndexError, ValueError):
+            pass
+    return None
+
+
+def read_h5(path: Union[str, List[str]]) -> List[Tuple]:
+    """Read HDF5 file(s) and return napari image layer data.
+    
+    Expects H5 files with a 'data' dataset containing the image array.
+    
+    Parameters
+    ----------
+    path : str or list of str
+        Path(s) to H5 file(s).
+        
+    Returns
+    -------
+    list of tuple
+        List of (data, kwargs, layer_type) tuples for napari.
+    """
+    if isinstance(path, str):
+        paths = [path]
+    else:
+        paths = path
+    
+    layers = []
+    
+    for file_path in paths:
+        file_path = Path(file_path)
+        name = file_path.stem
+        
+        # Read the H5 file
+        try:
+            with h5py.File(file_path, 'r') as f:
+                # Try common dataset names
+                if 'data' in f:
+                    data = f['data'][:]
+                elif 'image' in f:
+                    data = f['image'][:]
+                elif 'volume' in f:
+                    data = f['volume'][:]
+                else:
+                    # Use first dataset found
+                    keys = list(f.keys())
+                    if keys:
+                        data = f[keys[0]][:]
+                    else:
+                        print(f"Skipping {name}: no datasets found in H5 file")
+                        continue
+        except Exception as e:
+            print(f"Error reading H5 file {name}: {e}")
+            continue
+        
+        # Parse channel from filename for coloring
+        channel = _parse_h5_filename(name)
+        if channel:
+            channel_base = channel.replace(" Nar", "")
+            color = CHANNEL_COLORS.get(channel_base, "gray")
+        else:
+            color = "gray"
+        
+        print(f"Loading H5: {name}")
+        print(f"  Shape: {data.shape}")
+        print(f"  Dtype: {data.dtype}")
+        if channel:
+            print(f"  Channel: {channel} (color: {color})")
+        
+        layer_kwargs = {
+            'name': name,
+            'colormap': color,
+            'blending': 'additive',
+        }
+        
+        layers.append((data, layer_kwargs, 'image'))
+    
+    return layers
+
+
+def read_nd2(path: Union[str, List[str]]) -> List[Tuple]:
+    """Read Nikon ND2 file(s) and return napari image layer data.
+    
+    Handles duplicate channels by averaging them. For example, if there are
+    three Cy3 channels, they will be averaged into a single Cy3 layer.
+    
+    Parameters
+    ----------
+    path : str or list of str
+        Path(s) to ND2 file(s).
+        
+    Returns
+    -------
+    list of tuple
+        List of (data, kwargs, layer_type) tuples for napari.
+    """
+    if isinstance(path, str):
+        paths = [path]
+    else:
+        paths = path
+    
+    layers = []
+    
+    for file_path in paths:
+        file_path = Path(file_path)
+        name = file_path.stem
+        
+        try:
+            with nd2.ND2File(file_path) as f:
+                # Get full data array - shape is typically (Z, C, Y, X)
+                data = f.asarray()
+                
+                # Get channel names from metadata
+                channel_names = []
+                if f.metadata and f.metadata.channels:
+                    channel_names = [ch.channel.name for ch in f.metadata.channels]
+                
+                print(f"Loading ND2: {name}")
+                print(f"  Shape: {data.shape}")
+                print(f"  Channels: {channel_names}")
+                
+                # Group channels by name to handle duplicates
+                # data shape is (Z, C, Y, X)
+                if len(channel_names) == data.shape[1]:
+                    # Group channel indices by name
+                    channel_groups: Dict[str, List[int]] = defaultdict(list)
+                    for idx, ch_name in enumerate(channel_names):
+                        channel_groups[ch_name].append(idx)
+                    
+                    print(f"  Channel groups: {dict(channel_groups)}")
+                    
+                    # Process each unique channel
+                    for ch_name, indices in channel_groups.items():
+                        if len(indices) > 1:
+                            # Average duplicate channels
+                            ch_data = data[:, indices, :, :].mean(axis=1)
+                            print(f"  Averaged {len(indices)} '{ch_name}' channels")
+                        else:
+                            ch_data = data[:, indices[0], :, :]
+                        
+                        # Get color for this channel
+                        color = CHANNEL_COLORS.get(ch_name, "gray")
+                        
+                        layer_kwargs = {
+                            'name': f"{ch_name}-{name}",
+                            'colormap': color,
+                            'blending': 'additive',
+                        }
+                        
+                        layers.append((ch_data, layer_kwargs, 'image'))
+                else:
+                    # Fallback: no channel metadata or mismatch, load as-is
+                    print(f"  Warning: channel count mismatch, loading raw data")
+                    layer_kwargs = {
+                        'name': name,
+                        'blending': 'additive',
+                    }
+                    # If 4D with channel axis, set channel_axis
+                    if data.ndim == 4:
+                        layer_kwargs['channel_axis'] = 1
+                    layers.append((data, layer_kwargs, 'image'))
+                    
+        except Exception as e:
+            print(f"Error reading ND2 file {name}: {e}")
+            continue
     
     return layers
