@@ -485,10 +485,17 @@ def read_puncta_csv(path: Union[str, List[str]]) -> List[Tuple]:
         if channel:
             print(f"  Channel: {channel} (color: {color})")
         
+        # Use arrays for size and face_color to enable interactive editing in napari GUI
+        n_points = len(coords)
+        # Convert color name to RGBA array for per-point color editing
+        from napari.utils.colormaps.standardize_color import transform_color
+        rgba = transform_color(color)[0]  # Get RGBA values
+        face_colors = np.tile(rgba, (n_points, 1))  # (N, 4) array
+        
         layer_kwargs = {
             'name': layer_name,
-            'face_color': color,
-            'size': 3,
+            'face_color': face_colors,
+            'size': np.full(n_points, 3, dtype=np.float32),
             'blending': 'translucent',
         }
         

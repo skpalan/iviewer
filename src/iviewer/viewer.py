@@ -198,11 +198,17 @@ def add_puncta_locations(viewer, puncta_loc_dir, ref_z, puncta_z_scales):
             # Scale z-coordinates to match reference
             coords[:, 0] = coords[:, 0] * z_scale
             
+            # Use arrays for size and face_color to enable interactive editing in napari GUI
+            n_points = len(coords)
+            from napari.utils.colormaps.standardize_color import transform_color
+            rgba = transform_color(color)[0]  # Get RGBA values
+            face_colors = np.tile(rgba, (n_points, 1))  # (N, 4) array
+            
             viewer.add_points(
                 coords,
                 name=f"Loc {round_id} {channel}",
-                face_color=color,
-                size=3,
+                face_color=face_colors,
+                size=np.full(n_points, 3, dtype=np.float32),
                 blending="translucent",
                 visible=False,
             )
