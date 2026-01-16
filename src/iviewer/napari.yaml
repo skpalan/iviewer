@@ -19,3 +19,15 @@ contributions:
     - id: iviewer.get_reader
       python_name: iviewer.reader:get_reader
       title: Read TIFF, PNG, H5, ND2, and CSV files
+    - id: iviewer.layer_groups_widget
+      python_name: iviewer.group_widget:LayerGroupsWidget
+      title: Layer Groups
+    - id: iviewer.mask_highlight_widget
+      python_name: iviewer.mask_highlight_widget:MaskHighlightWidget
+      title: Mask Highlight
+
+  widgets:
+    - command: iviewer.layer_groups_widget
+      display_name: Layer Groups
+    - command: iviewer.mask_highlight_widget
+      display_name: Mask Highlight

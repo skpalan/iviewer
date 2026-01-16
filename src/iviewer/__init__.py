@@ -20,6 +20,9 @@ from .viewer import (
 
 from .reader import get_reader, read_puncta_csv, read_mask, read_h5, read_nd2
 
+from .group_widget import LayerGroupsWidget
+from .mask_highlight_widget import MaskHighlightWidget
+
 __all__ = [
     "__version__",
     "load_reference_image",
@@ -32,4 +35,6 @@ __all__ = [
     "read_mask",
     "read_h5",
     "read_nd2",
+    "LayerGroupsWidget",
+    "MaskHighlightWidget",
 ]

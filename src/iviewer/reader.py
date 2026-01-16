@@ -461,7 +461,7 @@ def read_puncta_csv(path: Union[str, List[str]]) -> List[Tuple]:
         # Extract coordinates (napari expects z, y, x order)
         coords = df[["z", "y", "x"]].values.copy()
         
-        # Parse filename to get round and channel info
+        # Parse filename to get channel info for coloring
         round_id, channel = _parse_puncta_filename(name)
         
         # Determine color based on channel
@@ -471,19 +471,13 @@ def read_puncta_csv(path: Union[str, List[str]]) -> List[Tuple]:
         else:
             color = "white"
         
-        # Build layer name
-        if round_id and channel:
-            layer_name = f"Loc {round_id} {channel}"
-        else:
-            layer_name = f"Loc {name}"
+        # Use original filename as layer name (for tidy grouping later)
+        layer_name = name
         
         # Print loading info
         print(f"Loading: {name}")
         print(f"  Points: {len(df)}")
-        if round_id:
-            print(f"  Round: {round_id}")
-        if channel:
-            print(f"  Channel: {channel} (color: {color})")
+        print(f"  Color: {color}")
         
         # Use arrays for size and face_color to enable interactive editing in napari GUI
         n_points = len(coords)
