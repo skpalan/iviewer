@@ -11,7 +11,7 @@ Provides folder/group functionality to organize layers:
 import re
 from typing import Dict, List, Optional, Set
 
-from qtpy.QtCore import Qt, Signal
+from qtpy.QtCore import Qt, Signal, QTimer
 from qtpy.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -26,6 +26,7 @@ from qtpy.QtWidgets import (
     QCheckBox,
     QLabel,
     QFrame,
+    QApplication,
 )
 from qtpy.QtGui import QDragEnterEvent, QDropEvent
 
@@ -68,6 +69,9 @@ class LayerGroupsWidget(QWidget):
         
         # Store original grid shape for restoration
         self._original_grid_shape: Optional[tuple] = None
+        
+        # Timer for debouncing grid refresh (prevents race conditions)
+        self._grid_refresh_timer: Optional[QTimer] = None
         
         self._setup_ui()
         self._connect_signals()
@@ -540,7 +544,6 @@ class LayerGroupsWidget(QWidget):
         
         # Restore original grid shape if it was stored (with delay for proper refresh)
         if self._original_grid_shape is not None and hasattr(self.viewer, 'grid'):
-            from qtpy.QtCore import QTimer
             QTimer.singleShot(50, self._do_restore_grid)
     
     def _do_restore_grid(self):
@@ -549,7 +552,6 @@ class LayerGroupsWidget(QWidget):
             return
         
         # Process any pending Qt events
-        from qtpy.QtWidgets import QApplication
         QApplication.processEvents()
         
         self.viewer.grid.shape = self._original_grid_shape
@@ -566,21 +568,33 @@ class LayerGroupsWidget(QWidget):
         Napari's grid mode calculates grid shape based on total layers,
         not visible ones. This method recalculates the grid shape to 
         match only the visible layers.
+        
+        Uses debouncing to prevent race conditions when multiple refreshes
+        are requested in quick succession.
         """
         if not hasattr(self.viewer, 'grid') or not self.viewer.grid.enabled:
             return
         
-        # Use a short delay to ensure visibility changes are processed first
-        from qtpy.QtCore import QTimer
-        QTimer.singleShot(50, self._do_grid_refresh)
+        # Cancel any pending refresh to prevent race conditions
+        if self._grid_refresh_timer is not None:
+            self._grid_refresh_timer.stop()
+            self._grid_refresh_timer.deleteLater()
+        
+        # Create new timer for debounced refresh
+        self._grid_refresh_timer = QTimer()
+        self._grid_refresh_timer.setSingleShot(True)
+        self._grid_refresh_timer.timeout.connect(self._do_grid_refresh)
+        self._grid_refresh_timer.start(100)  # 100ms delay for debouncing
     
     def _do_grid_refresh(self):
         """Actually perform the grid refresh after visibility changes are processed."""
+        # Clear timer reference
+        self._grid_refresh_timer = None
+        
         if not hasattr(self.viewer, 'grid') or not self.viewer.grid.enabled:
             return
         
         # Process any pending Qt events to ensure visibility is updated
-        from qtpy.QtWidgets import QApplication
         QApplication.processEvents()
         
         # Count visible layers
@@ -598,14 +612,15 @@ class LayerGroupsWidget(QWidget):
         # Store current stride
         current_stride = self.viewer.grid.stride
         
-        # Update grid shape to match visible layer count
+        # Set grid shape for visible layer count
         self.viewer.grid.shape = (rows, cols)
         
         # Toggle grid to force refresh with new shape
         self.viewer.grid.enabled = False
         self.viewer.grid.enabled = True
         
-        # Restore stride
+        # Restore shape and stride after toggle to ensure they're applied
+        self.viewer.grid.shape = (rows, cols)
         self.viewer.grid.stride = current_stride
     
     def _show_context_menu(self, position):

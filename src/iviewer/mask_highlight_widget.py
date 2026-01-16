@@ -10,7 +10,7 @@ Provides functionality to highlight layer content based on a selected mask:
 from typing import Dict, Optional, Tuple
 
 import numpy as np
-from qtpy.QtCore import Qt
+from qtpy.QtCore import Qt, QTimer
 from qtpy.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -24,6 +24,7 @@ from qtpy.QtWidgets import (
     QCheckBox,
     QSpinBox,
     QGroupBox,
+    QApplication,
 )
 from qtpy.QtGui import QColor
 
@@ -59,6 +60,9 @@ class MaskHighlightWidget(QWidget):
         
         # Track overlay layers we create
         self._overlay_layers: Dict[str, str] = {}  # target_layer -> overlay_layer_name
+        
+        # Timer for debouncing grid refresh (prevents race conditions)
+        self._grid_refresh_timer: Optional['QTimer'] = None
         
         self._setup_ui()
         self._connect_signals()
@@ -394,6 +398,9 @@ class MaskHighlightWidget(QWidget):
             self.lbl_status.setText(f"Highlighting applied to '{target_name}'")
             self.lbl_status.setStyleSheet("color: #4CAF50; font-weight: bold;")
             
+            # Refresh grid mode if active to fix potential display issues
+            self._refresh_grid_mode()
+            
         except Exception as e:
             self.lbl_status.setText(f"Error: {str(e)}")
             self.lbl_status.setStyleSheet("color: red;")
@@ -638,6 +645,9 @@ class MaskHighlightWidget(QWidget):
             
             self.lbl_status.setText(f"Reset '{target_name}' to original")
             self.lbl_status.setStyleSheet("color: gray; font-style: italic;")
+            
+            # Refresh grid mode if active
+            self._refresh_grid_mode()
         else:
             self.lbl_status.setText("No changes to reset")
             self.lbl_status.setStyleSheet("color: gray; font-style: italic;")
@@ -660,3 +670,79 @@ class MaskHighlightWidget(QWidget):
         self._highlight_settings.clear()
         self.lbl_status.setText("All layers reset")
         self.lbl_status.setStyleSheet("color: gray; font-style: italic;")
+        
+        # Refresh grid mode if active
+        self._refresh_grid_mode()
+    
+    def _refresh_grid_mode(self):
+        """Refresh grid mode after layer modifications to fix display issues.
+        
+        After modifying layer data or colors, napari's grid mode can get
+        confused about layer positioning. This forces a refresh.
+        
+        Uses debouncing to prevent race conditions when multiple refreshes
+        are requested in quick succession.
+        """
+        if not hasattr(self.viewer, 'grid') or not self.viewer.grid.enabled:
+            return
+        
+        # Cancel any pending refresh to prevent race conditions
+        if self._grid_refresh_timer is not None:
+            self._grid_refresh_timer.stop()
+            self._grid_refresh_timer.deleteLater()
+        
+        # Create new timer for debounced refresh
+        self._grid_refresh_timer = QTimer()
+        self._grid_refresh_timer.setSingleShot(True)
+        self._grid_refresh_timer.timeout.connect(self._do_grid_refresh)
+        self._grid_refresh_timer.start(100)  # 100ms delay for debouncing
+    
+    def _do_grid_refresh(self):
+        """Actually perform the grid refresh.
+        
+        After modifying layer data, napari's grid mode can get confused about
+        layer positioning. This method recalculates the grid shape based on
+        visible layers (not all layers) and forces a complete refresh.
+        
+        The key insight is that napari's grid uses layer indices to assign
+        grid positions, but hidden layers still "occupy" positions conceptually.
+        We must recalculate the shape based only on visible layers.
+        """
+        # Clear timer reference
+        self._grid_refresh_timer = None
+        
+        if not hasattr(self.viewer, 'grid') or not self.viewer.grid.enabled:
+            return
+        
+        # Process pending events to ensure layer updates are complete
+        QApplication.processEvents()
+        
+        # Count visible layers (same logic as group_widget)
+        visible_count = sum(1 for layer in self.viewer.layers if layer.visible)
+        
+        if visible_count == 0:
+            return
+        
+        # Calculate optimal grid shape for visible layers
+        # Try to make it roughly square
+        import math
+        cols = math.ceil(math.sqrt(visible_count))
+        rows = math.ceil(visible_count / cols)
+        
+        # Store current stride (we want to preserve this)
+        current_stride = self.viewer.grid.stride
+        
+        # Set grid shape for visible layer count
+        self.viewer.grid.shape = (rows, cols)
+        
+        # Toggle grid to force complete refresh
+        # Note: Don't call processEvents() between off/on to avoid race conditions
+        self.viewer.grid.enabled = False
+        self.viewer.grid.enabled = True
+        
+        # Restore shape and stride after toggle to ensure they're applied
+        self.viewer.grid.shape = (rows, cols)
+        self.viewer.grid.stride = current_stride
+        
+        # Reset the view to ensure proper rendering
+        self.viewer.reset_view()
