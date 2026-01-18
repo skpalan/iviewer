@@ -89,6 +89,9 @@ class RSFISHWorker(QThread):
         """Execute RS-FISH CLI."""
         try:
             # Build command
+            # Note: CLI parameter names differ from Fiji macro names:
+            # CLI uses: --supportRadius, --inlierRatio, --maxError
+            # Fiji macro uses: support, min_inlier_ratio, max_error
             cmd = [
                 self.rsfish_path,
                 f"--image={self.image_path}",
@@ -96,9 +99,9 @@ class RSFISHWorker(QThread):
                 f"--sigma={self.params['sigma']}",
                 f"--threshold={self.params['threshold']}",
                 f"--anisotropy={self.params['anisotropy']}",
-                f"--support={self.params['support']}",
-                f"--min_inlier_ratio={self.params['inlier_ratio']}",
-                f"--max_error={self.params['max_error']}",
+                f"--supportRadius={self.params['support']}",
+                f"--inlierRatio={self.params['inlier_ratio']}",
+                f"--maxError={self.params['max_error']}",
                 f"--background={self.params['background']}",
             ]
             
