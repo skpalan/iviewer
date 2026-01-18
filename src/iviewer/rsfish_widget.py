@@ -627,13 +627,28 @@ class RSFISHWidget(QWidget):
         self.lbl_roi_status.setText(f"ROI: {roi_size} pixels")
         self.lbl_roi_status.setStyleSheet("color: #4CAF50; font-size: 10px;")
         
-        # Run detection with offset information
+        # Calculate threshold scale factor based on intensity range difference
+        # The threshold is relative to intensity, so we need to scale it
+        # when the preview region has a different dynamic range than the full image
+        max_full = float(data.max())
+        max_preview = float(preview_data.max())
+        
+        if max_preview > 0 and max_full > 0:
+            threshold_scale = max_full / max_preview
+        else:
+            threshold_scale = 1.0
+        
+        # Log the scaling for user awareness
+        print(f"Threshold scaling: full_max={max_full:.1f}, preview_max={max_preview:.1f}, scale={threshold_scale:.3f}")
+        
+        # Run detection with offset information and threshold scaling
         self._run_detection(
             preview_data, 
             is_preview=True, 
             z_offset=z_offset,
             y_offset=y_min,
             x_offset=x_min,
+            threshold_scale=threshold_scale,
         )
     
     def _run_full_detection(self):
@@ -657,6 +672,7 @@ class RSFISHWidget(QWidget):
         z_offset: int = 0,
         y_offset: int = 0,
         x_offset: int = 0,
+        threshold_scale: float = 1.0,
     ):
         """Run RS-FISH detection on the given data.
         
@@ -672,6 +688,9 @@ class RSFISHWidget(QWidget):
             Y-offset to add to results (for ROI preview)
         x_offset : int
             X-offset to add to results (for ROI preview)
+        threshold_scale : float
+            Scale factor for threshold (used in preview mode to account for
+            different dynamic ranges between full image and preview region)
         """
         # Disable buttons during processing
         self.btn_preview.setEnabled(False)
@@ -697,6 +716,13 @@ class RSFISHWidget(QWidget):
         
         # Get parameters
         params = self._get_params()
+        
+        # Apply threshold scaling for preview mode
+        # This accounts for the different dynamic range between full image and preview region
+        if threshold_scale != 1.0:
+            original_threshold = params['threshold']
+            params['threshold'] = original_threshold * threshold_scale
+            print(f"Threshold scaled: {original_threshold} -> {params['threshold']:.6f} (scale={threshold_scale:.3f})")
         
         # Create and start worker
         self._worker = RSFISHWorker(
@@ -727,17 +753,18 @@ class RSFISHWidget(QWidget):
     
     def _on_detection_finished(self, df: pd.DataFrame):
         """Handle detection completion."""
+        # Read offsets from worker BEFORE resetting UI (which sets worker to None)
+        is_preview = getattr(self._worker, 'is_preview', False)
+        z_offset = getattr(self._worker, 'z_offset', 0)
+        y_offset = getattr(self._worker, 'y_offset', 0)
+        x_offset = getattr(self._worker, 'x_offset', 0)
+        
         self._reset_ui()
         
         if df is None or len(df) == 0:
             self.lbl_status.setText("No spots detected")
             self.lbl_status.setStyleSheet("color: orange;")
             return
-        
-        is_preview = getattr(self._worker, 'is_preview', False)
-        z_offset = getattr(self._worker, 'z_offset', 0)
-        y_offset = getattr(self._worker, 'y_offset', 0)
-        x_offset = getattr(self._worker, 'x_offset', 0)
         
         # Parse coordinates from DataFrame
         # RS-FISH output typically has columns: x, y, z (or similar)
