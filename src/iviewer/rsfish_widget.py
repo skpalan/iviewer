@@ -38,7 +38,7 @@ from qtpy.QtWidgets import (
 from tifffile import imwrite
 
 import napari
-from napari.layers import Image, Points
+from napari.layers import Image, Points, Shapes
 
 
 def find_rsfish_cli() -> Optional[str]:
@@ -167,9 +167,10 @@ class RSFISHWidget(QWidget):
         # Worker thread for background processing
         self._worker: Optional[RSFISHWorker] = None
         
-        # Track created points layers
+        # Track created layers
         self._points_layer_name = "RS-FISH Detections"
         self._preview_layer_name = "RS-FISH Preview"
+        self._roi_layer_name = "RS-FISH ROI"
         
         self._setup_ui()
         self._connect_signals()
@@ -325,11 +326,27 @@ class RSFISHWidget(QWidget):
         
         layout.addWidget(bg_group)
         
+        # Preview ROI section
+        roi_group = QGroupBox("Preview ROI")
+        roi_layout = QVBoxLayout(roi_group)
+        
+        self.btn_draw_roi = QPushButton("Draw ROI Rectangle")
+        self.btn_draw_roi.setToolTip("Draw a rectangle to define preview region (all Z-slices within XY bounds)")
+        self.btn_draw_roi.clicked.connect(self._create_roi_layer)
+        roi_layout.addWidget(self.btn_draw_roi)
+        
+        self.lbl_roi_status = QLabel("No ROI defined")
+        self.lbl_roi_status.setStyleSheet("color: gray; font-size: 10px;")
+        self.lbl_roi_status.setAlignment(Qt.AlignCenter)
+        roi_layout.addWidget(self.lbl_roi_status)
+        
+        layout.addWidget(roi_group)
+        
         # Action buttons
         btn_layout = QHBoxLayout()
         
-        self.btn_preview = QPushButton("Preview (slice)")
-        self.btn_preview.setToolTip("Run detection on current Z-slice for quick parameter tuning")
+        self.btn_preview = QPushButton("Preview (ROI)")
+        self.btn_preview.setToolTip("Run detection on ROI region (all Z-slices within XY bounds)")
         self.btn_preview.clicked.connect(self._run_preview)
         btn_layout.addWidget(self.btn_preview)
         
@@ -400,6 +417,7 @@ class RSFISHWidget(QWidget):
         self.btn_preview.setEnabled(enabled)
         self.btn_run.setEnabled(enabled)
         self.btn_calc_anisotropy.setEnabled(enabled)
+        self.btn_draw_roi.setEnabled(enabled)
     
     def _show_rsfish_not_found(self):
         """Show message about RS-FISH not being installed."""
@@ -469,8 +487,73 @@ class RSFISHWidget(QWidget):
             self._temp_dir = tempfile.TemporaryDirectory(prefix="iviewer_rsfish_")
         return self._temp_dir.name
     
+    def _create_roi_layer(self):
+        """Create or activate the ROI shapes layer for drawing preview region."""
+        # Check if ROI layer already exists
+        roi_layer = None
+        for layer in self.viewer.layers:
+            if layer.name == self._roi_layer_name and isinstance(layer, Shapes):
+                roi_layer = layer
+                break
+        
+        if roi_layer is None:
+            # Create new shapes layer
+            roi_layer = self.viewer.add_shapes(
+                name=self._roi_layer_name,
+                edge_color='yellow',
+                face_color='transparent',
+                edge_width=2,
+            )
+        
+        # Select the layer and set to rectangle drawing mode
+        self.viewer.layers.selection.active = roi_layer
+        roi_layer.mode = 'add_rectangle'
+        
+        self.lbl_status.setText("Draw a rectangle on the image to define preview ROI")
+        self.lbl_status.setStyleSheet("color: #2196F3;")
+        self.lbl_roi_status.setText("Drawing mode active...")
+        self.lbl_roi_status.setStyleSheet("color: #2196F3; font-size: 10px;")
+    
+    def _get_roi_bounds(self):
+        """Get the bounding box from the ROI shapes layer.
+        
+        Returns
+        -------
+        tuple or None
+            (y_min, y_max, x_min, x_max) or None if no ROI defined
+        """
+        # Find ROI layer
+        roi_layer = None
+        for layer in self.viewer.layers:
+            if layer.name == self._roi_layer_name and isinstance(layer, Shapes):
+                roi_layer = layer
+                break
+        
+        if roi_layer is None or len(roi_layer.data) == 0:
+            return None
+        
+        # Get the last shape (most recently drawn)
+        shape_data = roi_layer.data[-1]
+        
+        # shape_data is an array of vertices, get bounding box
+        # For rectangle, vertices are the corners
+        # Handle both 2D and 3D coordinates
+        if shape_data.shape[1] == 2:
+            # 2D: (y, x) coordinates
+            y_coords = shape_data[:, 0]
+            x_coords = shape_data[:, 1]
+        else:
+            # 3D: (z, y, x) coordinates - ignore z for XY ROI
+            y_coords = shape_data[:, -2]
+            x_coords = shape_data[:, -1]
+        
+        y_min, y_max = int(np.floor(y_coords.min())), int(np.ceil(y_coords.max()))
+        x_min, x_max = int(np.floor(x_coords.min())), int(np.ceil(x_coords.max()))
+        
+        return (y_min, y_max, x_min, x_max)
+    
     def _run_preview(self):
-        """Run RS-FISH on current Z-slice for quick preview."""
+        """Run RS-FISH on ROI region with all Z-slices."""
         if not self.rsfish_path:
             self._show_rsfish_not_found()
             return
@@ -481,23 +564,58 @@ class RSFISHWidget(QWidget):
             self.lbl_status.setStyleSheet("color: orange;")
             return
         
+        # Get ROI bounds
+        roi_bounds = self._get_roi_bounds()
+        if roi_bounds is None:
+            self.lbl_status.setText("No ROI defined. Click 'Draw ROI Rectangle' first.")
+            self.lbl_status.setStyleSheet("color: orange;")
+            return
+        
+        y_min, y_max, x_min, x_max = roi_bounds
         data = image_layer.data
         
-        # Get current Z slice
+        # Validate bounds
         if data.ndim == 3:
-            current_z = self.viewer.dims.current_step[0]
-            slice_data = data[current_z]
-            # For 2D preview, we need at least a small stack for RS-FISH
-            # Create a mini-stack with 3 slices centered on current
-            z_start = max(0, current_z - 1)
-            z_end = min(data.shape[0], current_z + 2)
-            preview_data = data[z_start:z_end]
-            z_offset = z_start
+            _, height, width = data.shape
+        elif data.ndim == 2:
+            height, width = data.shape
         else:
-            preview_data = data
-            z_offset = 0
+            self.lbl_status.setText(f"Unsupported image dimensions: {data.ndim}")
+            self.lbl_status.setStyleSheet("color: red;")
+            return
         
-        self._run_detection(preview_data, is_preview=True, z_offset=z_offset)
+        # Clamp to image bounds
+        y_min = max(0, y_min)
+        y_max = min(height, y_max)
+        x_min = max(0, x_min)
+        x_max = min(width, x_max)
+        
+        if y_max <= y_min or x_max <= x_min:
+            self.lbl_status.setText("Invalid ROI: zero size region")
+            self.lbl_status.setStyleSheet("color: red;")
+            return
+        
+        # Extract ROI from all Z-slices
+        if data.ndim == 3:
+            preview_data = data[:, y_min:y_max, x_min:x_max]
+        else:
+            preview_data = data[y_min:y_max, x_min:x_max]
+        
+        roi_size = f"{y_max - y_min} x {x_max - x_min}"
+        if data.ndim == 3:
+            roi_size = f"{data.shape[0]} x {roi_size}"
+        
+        self.lbl_roi_status.setText(f"ROI: {roi_size} pixels")
+        self.lbl_roi_status.setStyleSheet("color: #4CAF50; font-size: 10px;")
+        
+        # Run detection with XY offset information
+        self._run_detection(
+            preview_data, 
+            is_preview=True, 
+            z_offset=0,
+            y_offset=y_min,
+            x_offset=x_min,
+        )
     
     def _run_full_detection(self):
         """Run RS-FISH on entire volume."""
@@ -513,7 +631,14 @@ class RSFISHWidget(QWidget):
         
         self._run_detection(image_layer.data, is_preview=False)
     
-    def _run_detection(self, data: np.ndarray, is_preview: bool = False, z_offset: int = 0):
+    def _run_detection(
+        self, 
+        data: np.ndarray, 
+        is_preview: bool = False, 
+        z_offset: int = 0,
+        y_offset: int = 0,
+        x_offset: int = 0,
+    ):
         """Run RS-FISH detection on the given data.
         
         Parameters
@@ -523,7 +648,11 @@ class RSFISHWidget(QWidget):
         is_preview : bool
             If True, this is a preview run
         z_offset : int
-            Z-offset to add to results (for preview mode)
+            Z-offset to add to results (for cropped regions)
+        y_offset : int
+            Y-offset to add to results (for ROI preview)
+        x_offset : int
+            X-offset to add to results (for ROI preview)
         """
         # Disable buttons during processing
         self.btn_preview.setEnabled(False)
@@ -561,6 +690,8 @@ class RSFISHWidget(QWidget):
         # Store metadata for result handling
         self._worker.is_preview = is_preview
         self._worker.z_offset = z_offset
+        self._worker.y_offset = y_offset
+        self._worker.x_offset = x_offset
         
         self._worker.progress.connect(self._on_progress)
         self._worker.finished.connect(self._on_detection_finished)
@@ -586,32 +717,55 @@ class RSFISHWidget(QWidget):
         
         is_preview = getattr(self._worker, 'is_preview', False)
         z_offset = getattr(self._worker, 'z_offset', 0)
+        y_offset = getattr(self._worker, 'y_offset', 0)
+        x_offset = getattr(self._worker, 'x_offset', 0)
         
         # Parse coordinates from DataFrame
         # RS-FISH output typically has columns: x, y, z (or similar)
         # Try common column name patterns
         coord_cols = None
+        col_order = None  # Track if we need to reorder (z,y,x) vs (x,y,z)
+        
         for pattern in [('z', 'y', 'x'), ('Z', 'Y', 'X'), ('axis-0', 'axis-1', 'axis-2')]:
             if all(c in df.columns for c in pattern):
                 coord_cols = pattern
+                col_order = 'zyx'
                 break
+        
+        # Also check for x, y, z order (common in some RS-FISH outputs)
+        if coord_cols is None:
+            for pattern in [('x', 'y', 'z'), ('X', 'Y', 'Z')]:
+                if all(c in df.columns for c in pattern):
+                    coord_cols = pattern
+                    col_order = 'xyz'
+                    break
         
         if coord_cols is None:
             # Fall back to first 3 numeric columns
             numeric_cols = df.select_dtypes(include=[np.number]).columns[:3]
             if len(numeric_cols) >= 3:
                 coord_cols = tuple(numeric_cols)
+                col_order = 'zyx'  # Assume zyx order
             else:
                 self.lbl_status.setText(f"Could not parse coordinates from output. Columns: {list(df.columns)}")
                 self.lbl_status.setStyleSheet("color: red;")
                 return
         
-        # Extract coordinates (napari expects z, y, x order)
-        coords = df[list(coord_cols)].values
+        # Extract coordinates
+        coords = df[list(coord_cols)].values.copy()
         
-        # Apply z-offset for preview mode
+        # Convert to napari order (z, y, x) if needed
+        if col_order == 'xyz':
+            # Reorder from (x, y, z) to (z, y, x)
+            coords = coords[:, [2, 1, 0]]
+        
+        # Apply offsets to map back to original image coordinates
         if z_offset > 0:
             coords[:, 0] += z_offset
+        if y_offset > 0:
+            coords[:, 1] += y_offset
+        if x_offset > 0:
+            coords[:, 2] += x_offset
         
         # Get intensity if available
         intensity_col = None
@@ -665,14 +819,16 @@ class RSFISHWidget(QWidget):
         self._worker = None
     
     def _clear_results(self):
-        """Remove detected spots layers."""
-        for layer_name in (self._points_layer_name, self._preview_layer_name):
+        """Remove detected spots layers and ROI."""
+        for layer_name in (self._points_layer_name, self._preview_layer_name, self._roi_layer_name):
             for layer in list(self.viewer.layers):
                 if layer.name == layer_name:
                     self.viewer.layers.remove(layer)
         
         self.lbl_status.setText("Results cleared")
         self.lbl_status.setStyleSheet("color: gray; font-style: italic;")
+        self.lbl_roi_status.setText("No ROI defined")
+        self.lbl_roi_status.setStyleSheet("color: gray; font-size: 10px;")
     
     def _export_results(self):
         """Export detected spots to CSV file."""
