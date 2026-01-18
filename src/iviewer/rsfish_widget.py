@@ -107,8 +107,8 @@ class RSFISHWorker(QThread):
             
             # Add optional intensity range
             if not self.params.get('auto_minmax', True):
-                cmd.append(f"--min={self.params['min_intensity']}")
-                cmd.append(f"--max={self.params['max_intensity']}")
+                cmd.append(f"--minIntensity={self.params['min_intensity']}")
+                cmd.append(f"--maxIntensity={self.params['max_intensity']}")
             
             self.progress.emit(f"Running: {' '.join(cmd)}")
             
