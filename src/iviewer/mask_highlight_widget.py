@@ -64,6 +64,12 @@ class MaskHighlightWidget(QWidget):
         # Timer for debouncing grid refresh (prevents race conditions)
         self._grid_refresh_timer: Optional['QTimer'] = None
         
+        # Track layer names by layer ID for detecting renames
+        self._layer_names: Dict[int, str] = {}
+        
+        # Store callbacks for layer name change events
+        self._layer_name_callbacks: Dict[int, callable] = {}
+        
         self._setup_ui()
         self._connect_signals()
         self._refresh_layer_lists()
@@ -216,9 +222,13 @@ class MaskHighlightWidget(QWidget):
     
     def _connect_signals(self):
         """Connect to napari viewer signals."""
-        self.viewer.layers.events.inserted.connect(self._on_layers_changed)
-        self.viewer.layers.events.removed.connect(self._on_layers_changed)
+        self.viewer.layers.events.inserted.connect(self._on_layer_inserted)
+        self.viewer.layers.events.removed.connect(self._on_layer_removed)
         self.viewer.layers.events.reordered.connect(self._on_layers_changed)
+        
+        # Connect to existing layers' name change events
+        for layer in self.viewer.layers:
+            self._connect_layer_name_signal(layer)
         
         # Connect settings changes for live preview
         self.combo_mask.currentTextChanged.connect(self._on_settings_changed)
@@ -227,6 +237,76 @@ class MaskHighlightWidget(QWidget):
         self.slider_opacity.valueChanged.connect(self._on_settings_changed)
         self.chk_use_tint.stateChanged.connect(self._on_settings_changed)
         self.chk_hide_edge.stateChanged.connect(self._on_settings_changed)
+    
+    def _connect_layer_name_signal(self, layer):
+        """Connect to a layer's name change event and track its name."""
+        layer_id = id(layer)
+        
+        # Store the current name for tracking renames
+        self._layer_names[layer_id] = layer.name
+        
+        # Create a closure to capture the layer reference
+        def on_name_change(event):
+            self._on_layer_name_changed(layer)
+        
+        # Store the callback reference so we can disconnect later if needed
+        self._layer_name_callbacks[layer_id] = on_name_change
+        
+        # Connect to the name change event
+        layer.events.name.connect(on_name_change)
+    
+    def _on_layer_inserted(self, event):
+        """Handle layer added to viewer."""
+        layer = event.value
+        self._connect_layer_name_signal(layer)
+        self._refresh_layer_lists()
+    
+    def _on_layer_removed(self, event):
+        """Handle layer removed from viewer."""
+        layer = event.value
+        layer_id = id(layer)
+        
+        # Clean up tracking data
+        if layer_id in self._layer_name_callbacks:
+            del self._layer_name_callbacks[layer_id]
+        if layer_id in self._layer_names:
+            del self._layer_names[layer_id]
+        
+        self._refresh_layer_lists()
+    
+    def _on_layer_name_changed(self, layer):
+        """Handle layer name change - update internal dictionaries.
+        
+        This ensures that stored original data and settings are accessible
+        after a layer is renamed (e.g., by Tidy Layers or manual rename).
+        """
+        layer_id = id(layer)
+        new_name = layer.name
+        
+        # Get the old name from our tracking dict
+        old_name = self._layer_names.get(layer_id)
+        
+        if old_name is None or old_name == new_name:
+            # No tracked name or name hasn't actually changed
+            return
+        
+        # Update our tracking to the new name
+        self._layer_names[layer_id] = new_name
+        
+        # Update _original_data if the old name was stored
+        if old_name in self._original_data:
+            self._original_data[new_name] = self._original_data.pop(old_name)
+        
+        # Update _highlight_settings if the old name was stored
+        if old_name in self._highlight_settings:
+            self._highlight_settings[new_name] = self._highlight_settings.pop(old_name)
+        
+        # Update _overlay_layers if the old name was stored
+        if old_name in self._overlay_layers:
+            self._overlay_layers[new_name] = self._overlay_layers.pop(old_name)
+        
+        # Refresh the combo boxes to show the new name
+        self._refresh_layer_lists()
     
     def _on_layers_changed(self, event=None):
         """Handle layer list changes."""
