@@ -334,7 +334,7 @@ class RSFISHWidget(QWidget):
         roi_layout = QVBoxLayout(roi_group)
         
         self.btn_draw_roi = QPushButton("Draw ROI Rectangle")
-        self.btn_draw_roi.setToolTip("Draw a rectangle to define preview region (all Z-slices within XY bounds)")
+        self.btn_draw_roi.setToolTip("Draw a rectangle to define preview region (10 Z-slices within XY bounds)")
         self.btn_draw_roi.clicked.connect(self._create_roi_layer)
         roi_layout.addWidget(self.btn_draw_roi)
         
@@ -349,7 +349,7 @@ class RSFISHWidget(QWidget):
         btn_layout = QHBoxLayout()
         
         self.btn_preview = QPushButton("Preview (ROI)")
-        self.btn_preview.setToolTip("Run detection on ROI region (all Z-slices within XY bounds)")
+        self.btn_preview.setToolTip("Run detection on ROI region (10 Z-slices centered on current position)")
         self.btn_preview.clicked.connect(self._run_preview)
         btn_layout.addWidget(self.btn_preview)
         
@@ -556,7 +556,7 @@ class RSFISHWidget(QWidget):
         return (y_min, y_max, x_min, x_max)
     
     def _run_preview(self):
-        """Run RS-FISH on ROI region with all Z-slices."""
+        """Run RS-FISH on ROI region with 10 Z-slices centered on current position."""
         if not self.rsfish_path:
             self._show_rsfish_not_found()
             return
@@ -598,24 +598,40 @@ class RSFISHWidget(QWidget):
             self.lbl_status.setStyleSheet("color: red;")
             return
         
-        # Extract ROI from all Z-slices
+        # Extract ROI with limited Z-slices for faster preview
+        z_offset = 0
         if data.ndim == 3:
-            preview_data = data[:, y_min:y_max, x_min:x_max]
+            n_slices = data.shape[0]
+            preview_z_slices = 10  # Take 10 Z-slices for preview
+            
+            # Center around current Z position
+            current_z = self.viewer.dims.current_step[0]
+            half_slices = preview_z_slices // 2
+            
+            z_start = max(0, current_z - half_slices)
+            z_end = min(n_slices, z_start + preview_z_slices)
+            
+            # Adjust start if we hit the end
+            if z_end - z_start < preview_z_slices:
+                z_start = max(0, z_end - preview_z_slices)
+            
+            preview_data = data[z_start:z_end, y_min:y_max, x_min:x_max]
+            z_offset = z_start
+            
+            actual_z = z_end - z_start
+            roi_size = f"{actual_z} x {y_max - y_min} x {x_max - x_min}"
         else:
             preview_data = data[y_min:y_max, x_min:x_max]
-        
-        roi_size = f"{y_max - y_min} x {x_max - x_min}"
-        if data.ndim == 3:
-            roi_size = f"{data.shape[0]} x {roi_size}"
+            roi_size = f"{y_max - y_min} x {x_max - x_min}"
         
         self.lbl_roi_status.setText(f"ROI: {roi_size} pixels")
         self.lbl_roi_status.setStyleSheet("color: #4CAF50; font-size: 10px;")
         
-        # Run detection with XY offset information
+        # Run detection with offset information
         self._run_detection(
             preview_data, 
             is_preview=True, 
-            z_offset=0,
+            z_offset=z_offset,
             y_offset=y_min,
             x_offset=x_min,
         )
