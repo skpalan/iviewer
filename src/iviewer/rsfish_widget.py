@@ -105,11 +105,6 @@ class RSFISHWorker(QThread):
                 f"--background={self.params['background']}",
             ]
             
-            # Add optional intensity range
-            if not self.params.get('auto_minmax', True):
-                cmd.append(f"--minIntensity={self.params['min_intensity']}")
-                cmd.append(f"--maxIntensity={self.params['max_intensity']}")
-            
             self.progress.emit(f"Running: {' '.join(cmd)}")
             
             # Run RS-FISH
@@ -213,11 +208,6 @@ class RSFISHWidget(QWidget):
         self.combo_image = QComboBox()
         self.combo_image.setToolTip("Select the image layer to detect spots in")
         img_layout.addWidget(self.combo_image)
-        
-        self.chk_auto_minmax = QCheckBox("Compute min/max from image")
-        self.chk_auto_minmax.setChecked(True)
-        self.chk_auto_minmax.setToolTip("Automatically compute intensity range from image")
-        img_layout.addWidget(self.chk_auto_minmax)
         
         layout.addWidget(img_group)
         
@@ -334,9 +324,19 @@ class RSFISHWidget(QWidget):
         roi_layout = QVBoxLayout(roi_group)
         
         self.btn_draw_roi = QPushButton("Draw ROI Rectangle")
-        self.btn_draw_roi.setToolTip("Draw a rectangle to define preview region (10 Z-slices within XY bounds)")
+        self.btn_draw_roi.setToolTip("Draw a rectangle to define preview region within XY bounds")
         self.btn_draw_roi.clicked.connect(self._create_roi_layer)
         roi_layout.addWidget(self.btn_draw_roi)
+        
+        # Z-slices for preview
+        z_slices_layout = QHBoxLayout()
+        z_slices_layout.addWidget(QLabel("Z-slices:"))
+        self.spin_preview_z = QSpinBox()
+        self.spin_preview_z.setRange(5, 200)
+        self.spin_preview_z.setValue(30)
+        self.spin_preview_z.setToolTip("Number of Z-slices to include in preview (centered on current position)")
+        z_slices_layout.addWidget(self.spin_preview_z)
+        roi_layout.addLayout(z_slices_layout)
         
         self.lbl_roi_status = QLabel("No ROI defined")
         self.lbl_roi_status.setStyleSheet("color: gray; font-size: 10px;")
@@ -349,7 +349,7 @@ class RSFISHWidget(QWidget):
         btn_layout = QHBoxLayout()
         
         self.btn_preview = QPushButton("Preview (ROI)")
-        self.btn_preview.setToolTip("Run detection on ROI region (10 Z-slices centered on current position)")
+        self.btn_preview.setToolTip("Run detection on ROI region (Z-slices centered on current position)")
         self.btn_preview.clicked.connect(self._run_preview)
         btn_layout.addWidget(self.btn_preview)
         
@@ -481,7 +481,6 @@ class RSFISHWidget(QWidget):
             'inlier_ratio': self.spin_inlier.value(),
             'max_error': self.spin_max_error.value(),
             'background': self.combo_background.currentIndex(),
-            'auto_minmax': self.chk_auto_minmax.isChecked(),
         }
     
     def _get_temp_dir(self) -> str:
@@ -602,7 +601,7 @@ class RSFISHWidget(QWidget):
         z_offset = 0
         if data.ndim == 3:
             n_slices = data.shape[0]
-            preview_z_slices = 10  # Take 10 Z-slices for preview
+            preview_z_slices = self.spin_preview_z.value()
             
             # Center around current Z position
             current_z = self.viewer.dims.current_step[0]
@@ -639,7 +638,8 @@ class RSFISHWidget(QWidget):
             threshold_scale = 1.0
         
         # Log the scaling for user awareness
-        print(f"Threshold scaling: full_max={max_full:.1f}, preview_max={max_preview:.1f}, scale={threshold_scale:.3f}")
+        self.txt_log.append(f"Preview intensity: max={max_preview:.1f}, full image max={max_full:.1f}")
+        self.txt_log.append(f"Threshold scale factor: {threshold_scale:.3f}")
         
         # Run detection with offset information and threshold scaling
         self._run_detection(
@@ -722,7 +722,7 @@ class RSFISHWidget(QWidget):
         if threshold_scale != 1.0:
             original_threshold = params['threshold']
             params['threshold'] = original_threshold * threshold_scale
-            print(f"Threshold scaled: {original_threshold} -> {params['threshold']:.6f} (scale={threshold_scale:.3f})")
+            self.txt_log.append(f"Threshold scaled: {original_threshold:.6f} -> {params['threshold']:.6f} (scale={threshold_scale:.3f})")
         
         # Create and start worker
         self._worker = RSFISHWorker(
