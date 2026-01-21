@@ -5,11 +5,14 @@ Provides functionality to highlight layer content based on a selected mask:
 - Choose a mask layer to use for highlighting
 - Adjust transparency of content outside the mask
 - Adjust color/tint of content outside the mask
+- List all cells in mask with statistics (voxel count, centroid)
+- Select and highlight specific cells in 2D/3D view
 """
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
+from scipy import ndimage
 from qtpy.QtCore import Qt, QTimer
 from qtpy.QtWidgets import (
     QWidget,
@@ -25,6 +28,10 @@ from qtpy.QtWidgets import (
     QSpinBox,
     QGroupBox,
     QApplication,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
+    QAbstractItemView,
 )
 from qtpy.QtGui import QColor
 
@@ -41,6 +48,8 @@ class MaskHighlightWidget(QWidget):
     - Adjust transparency of content outside the mask
     - Set a color tint for content outside the mask
     - Option to highlight specific label IDs within the mask
+    - List all cells in mask with statistics (ID, voxel count, centroid)
+    - Select and highlight specific cells in both 2D and 3D view modes
     
     Parameters
     ----------
@@ -69,6 +78,13 @@ class MaskHighlightWidget(QWidget):
         
         # Store callbacks for layer name change events
         self._layer_name_callbacks: Dict[int, callable] = {}
+        
+        # Cell list state
+        self._cell_ids: List[int] = []  # All cell IDs in current mask
+        self._cell_stats: Dict[int, dict] = {}  # {cell_id: {'voxels': int, 'centroid': tuple}}
+        self._selected_cell_ids: Set[int] = set()  # Currently selected cells
+        self._cell_selection_overlay: Optional[str] = None  # Name of overlay layer
+        self._original_mask_opacity: float = 0.5  # For restoration
         
         self._setup_ui()
         self._connect_signals()
@@ -129,6 +145,67 @@ class MaskHighlightWidget(QWidget):
         mask_layout.addWidget(self.chk_invert)
         
         layout.addWidget(mask_group)
+        
+        # Cell List section
+        cell_list_group = QGroupBox("Cell List")
+        cell_list_layout = QVBoxLayout(cell_list_group)
+        
+        # Action buttons for cell list
+        cell_btn_layout = QHBoxLayout()
+        
+        self.btn_refresh_cells = QPushButton("Refresh")
+        self.btn_refresh_cells.setToolTip("Refresh cell list from mask layer")
+        self.btn_refresh_cells.clicked.connect(self._refresh_cell_list)
+        cell_btn_layout.addWidget(self.btn_refresh_cells)
+        
+        self.btn_select_all_cells = QPushButton("Select All")
+        self.btn_select_all_cells.setToolTip("Select all cells")
+        self.btn_select_all_cells.clicked.connect(self._select_all_cells)
+        cell_btn_layout.addWidget(self.btn_select_all_cells)
+        
+        self.btn_clear_cell_selection = QPushButton("Clear")
+        self.btn_clear_cell_selection.setToolTip("Clear cell selection")
+        self.btn_clear_cell_selection.clicked.connect(self._clear_cell_selection)
+        cell_btn_layout.addWidget(self.btn_clear_cell_selection)
+        
+        cell_list_layout.addLayout(cell_btn_layout)
+        
+        # Table widget for cell list
+        self.table_cells = QTableWidget()
+        self.table_cells.setColumnCount(3)
+        self.table_cells.setHorizontalHeaderLabels(["ID", "Voxels", "Centroid (Z, Y, X)"])
+        self.table_cells.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table_cells.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.table_cells.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table_cells.horizontalHeader().setStretchLastSection(True)
+        self.table_cells.setColumnWidth(0, 60)
+        self.table_cells.setColumnWidth(1, 80)
+        self.table_cells.setFixedHeight(200)
+        self.table_cells.verticalScrollBar().valueChanged.connect(self._on_table_scroll)
+        self.table_cells.itemSelectionChanged.connect(self._on_cell_selection_changed)
+        cell_list_layout.addWidget(self.table_cells)
+        
+        # Cell count label
+        self.lbl_cell_count = QLabel("Selected: 0 | Total: 0 cells")
+        self.lbl_cell_count.setStyleSheet("color: gray; font-style: italic;")
+        cell_list_layout.addWidget(self.lbl_cell_count)
+        
+        # Highlight buttons
+        highlight_btn_layout = QHBoxLayout()
+        
+        self.btn_highlight_cells = QPushButton("Highlight Selected")
+        self.btn_highlight_cells.setToolTip("Highlight selected cells in 2D/3D view")
+        self.btn_highlight_cells.clicked.connect(self._highlight_selected_cells)
+        highlight_btn_layout.addWidget(self.btn_highlight_cells)
+        
+        self.btn_clear_highlight = QPushButton("Clear Highlight")
+        self.btn_clear_highlight.setToolTip("Remove cell highlighting")
+        self.btn_clear_highlight.clicked.connect(self._clear_cell_highlight)
+        highlight_btn_layout.addWidget(self.btn_clear_highlight)
+        
+        cell_list_layout.addLayout(highlight_btn_layout)
+        
+        layout.addWidget(cell_list_group)
         
         # Outside mask appearance
         appear_group = QGroupBox("Outside Mask Appearance")
@@ -237,6 +314,9 @@ class MaskHighlightWidget(QWidget):
         self.slider_opacity.valueChanged.connect(self._on_settings_changed)
         self.chk_use_tint.stateChanged.connect(self._on_settings_changed)
         self.chk_hide_edge.stateChanged.connect(self._on_settings_changed)
+        
+        # Connect mask changes to refresh cell list
+        self.combo_mask.currentTextChanged.connect(self._refresh_cell_list)
     
     def _connect_layer_name_signal(self, layer):
         """Connect to a layer's name change event and track its name."""
@@ -616,8 +696,6 @@ class MaskHighlightWidget(QWidget):
         - 2D mask for 3D data (broadcast along Z)
         - Different XY dimensions (resize)
         """
-        from scipy import ndimage
-        
         # If mask is 2D and target is 3D, broadcast
         if mask.ndim == 2 and len(target_shape) == 3:
             # Resize 2D mask to match XY dimensions
@@ -753,6 +831,245 @@ class MaskHighlightWidget(QWidget):
         
         # Refresh grid mode if active
         self._refresh_grid_mode()
+    
+    def _refresh_cell_list(self):
+        """Populate cell list table from selected mask layer."""
+        mask_layer = self._get_mask_layer()
+        
+        # Clear table and state
+        self.table_cells.setRowCount(0)
+        self._cell_ids = []
+        self._cell_stats = {}
+        self._selected_cell_ids.clear()
+        self._update_cell_count_label()
+        
+        if mask_layer is None:
+            return
+        
+        # Get unique cell IDs (excluding background 0)
+        unique_ids = np.unique(mask_layer.data)
+        self._cell_ids = [int(cid) for cid in unique_ids if cid > 0]
+        
+        # For small datasets (< 500 cells), compute all stats upfront
+        # For larger datasets, use lazy loading
+        if len(self._cell_ids) < 500:
+            self._compute_all_cell_stats(mask_layer.data)
+        
+        # Populate table rows
+        self.table_cells.setRowCount(len(self._cell_ids))
+        for row, cell_id in enumerate(self._cell_ids):
+            # ID column
+            id_item = QTableWidgetItem(str(cell_id))
+            id_item.setData(Qt.UserRole, cell_id)
+            self.table_cells.setItem(row, 0, id_item)
+            
+            # Check if stats already computed
+            if cell_id in self._cell_stats:
+                stats = self._cell_stats[cell_id]
+                self.table_cells.setItem(row, 1, QTableWidgetItem(str(stats['voxels'])))
+                centroid = stats['centroid']
+                if len(centroid) == 3:
+                    centroid_str = f"({centroid[0]:.1f}, {centroid[1]:.1f}, {centroid[2]:.1f})"
+                elif len(centroid) == 2:
+                    centroid_str = f"({centroid[0]:.1f}, {centroid[1]:.1f})"
+                else:
+                    centroid_str = str(centroid)
+                self.table_cells.setItem(row, 2, QTableWidgetItem(centroid_str))
+            else:
+                # Placeholder for lazy loading
+                self.table_cells.setItem(row, 1, QTableWidgetItem("..."))
+                self.table_cells.setItem(row, 2, QTableWidgetItem("..."))
+        
+        self._update_cell_count_label()
+        
+        # For large datasets, compute stats for visible rows
+        if len(self._cell_ids) >= 500:
+            self._compute_visible_cell_stats()
+    
+    def _compute_all_cell_stats(self, mask_data):
+        """Compute stats for all cells at once using vectorized operations.
+        
+        This method uses scipy.ndimage.center_of_mass and numpy.unique to
+        compute all cell statistics in O(M) time where M is the number of
+        voxels, rather than O(N × M) where N is the number of cells.
+        
+        Parameters
+        ----------
+        mask_data : np.ndarray
+            The mask layer data array
+        """
+        # Compute voxel counts for all labels in one pass using unique
+        unique_labels, counts = np.unique(mask_data, return_counts=True)
+        label_to_count = dict(zip(unique_labels, counts))
+        
+        # Compute centroids for all cells in one pass using scipy
+        # center_of_mass returns centroids for all specified labels at once
+        centroids = ndimage.center_of_mass(
+            np.ones_like(mask_data),  # Input (uniform mass)
+            labels=mask_data,          # Label array
+            index=self._cell_ids       # Compute for these specific labels
+        )
+        
+        # Handle case where only one cell is present (returns single tuple instead of list)
+        if len(self._cell_ids) == 1:
+            centroids = [centroids]
+        
+        # Store results for all cells
+        for i, cell_id in enumerate(self._cell_ids):
+            voxel_count = label_to_count.get(cell_id, 0)
+            
+            # Convert centroid to tuple if it's an array/list
+            centroid = centroids[i]
+            if not isinstance(centroid, tuple):
+                centroid = tuple(float(c) for c in centroid)
+            
+            self._cell_stats[cell_id] = {
+                'voxels': voxel_count,
+                'centroid': centroid,
+            }
+    
+    def _compute_visible_cell_stats(self):
+        """Compute stats for currently visible table rows (lazy loading for large datasets)."""
+        mask_layer = self._get_mask_layer()
+        if mask_layer is None or len(self._cell_ids) == 0:
+            return
+        
+        # Get visible row range
+        first_visible = self.table_cells.rowAt(0)
+        last_visible = self.table_cells.rowAt(self.table_cells.viewport().height())
+        
+        if first_visible < 0:
+            first_visible = 0
+        if last_visible < 0:
+            last_visible = len(self._cell_ids) - 1
+        
+        # Compute stats for visible cells that haven't been computed
+        mask_data = mask_layer.data
+        for row in range(first_visible, min(last_visible + 1, len(self._cell_ids))):
+            cell_id = self._cell_ids[row]
+            if cell_id in self._cell_stats:
+                continue  # Already computed
+            
+            # Calculate stats
+            mask = mask_data == cell_id
+            voxel_count = int(np.sum(mask))
+            
+            # Centroid via np.where and mean
+            coords = np.where(mask)
+            centroid = tuple(float(np.mean(c)) for c in coords)
+            
+            self._cell_stats[cell_id] = {
+                'voxels': voxel_count,
+                'centroid': centroid,
+            }
+            
+            # Update table
+            self.table_cells.item(row, 1).setText(str(voxel_count))
+            if len(centroid) == 3:
+                centroid_str = f"({centroid[0]:.1f}, {centroid[1]:.1f}, {centroid[2]:.1f})"
+            elif len(centroid) == 2:
+                centroid_str = f"({centroid[0]:.1f}, {centroid[1]:.1f})"
+            else:
+                centroid_str = str(centroid)
+            self.table_cells.item(row, 2).setText(centroid_str)
+    
+    def _on_table_scroll(self):
+        """Handle table scroll to compute stats for newly visible cells."""
+        self._compute_visible_cell_stats()
+    
+    def _on_cell_selection_changed(self):
+        """Handle table selection changes."""
+        selected_rows = self.table_cells.selectionModel().selectedRows()
+        self._selected_cell_ids = {
+            self._cell_ids[row.row()] 
+            for row in selected_rows
+            if row.row() < len(self._cell_ids)
+        }
+        self._update_cell_count_label()
+    
+    def _select_all_cells(self):
+        """Select all cells in the table."""
+        self.table_cells.selectAll()
+        self._on_cell_selection_changed()
+    
+    def _clear_cell_selection(self):
+        """Clear cell selection."""
+        self.table_cells.clearSelection()
+        self._selected_cell_ids.clear()
+        self._update_cell_count_label()
+    
+    def _update_cell_count_label(self):
+        """Update the cell count status label."""
+        total = len(self._cell_ids)
+        selected = len(self._selected_cell_ids)
+        self.lbl_cell_count.setText(f"Selected: {selected} | Total: {total} cells")
+    
+    def _highlight_selected_cells(self):
+        """Highlight selected cells in both 2D and 3D view."""
+        mask_layer = self._get_mask_layer()
+        if mask_layer is None:
+            self.lbl_status.setText("No mask layer selected")
+            self.lbl_status.setStyleSheet("color: orange;")
+            return
+        
+        if not self._selected_cell_ids:
+            self.lbl_status.setText("No cells selected")
+            self.lbl_status.setStyleSheet("color: orange;")
+            return
+        
+        # Clear any existing highlight first
+        self._clear_cell_highlight()
+        
+        # Store original opacity for restoration
+        self._original_mask_opacity = mask_layer.opacity
+        
+        # Create selection mask containing only selected cells
+        selection_mask = np.zeros_like(mask_layer.data)
+        for cell_id in self._selected_cell_ids:
+            selection_mask[mask_layer.data == cell_id] = cell_id
+        
+        # Create overlay layer
+        overlay_name = f"_cell_highlight_{mask_layer.name}"
+        
+        if selection_mask.max() > 0:
+            overlay = self.viewer.add_labels(
+                selection_mask,
+                name=overlay_name,
+                opacity=1.0,
+                blending="translucent",
+            )
+            # Copy colormap from original
+            overlay.colormap = mask_layer.colormap
+            
+            # Enable bounding box for 3D visualization
+            overlay.bounding_box.visible = True
+            overlay.bounding_box.line_color = "yellow"
+            
+            # Dim original mask
+            mask_layer.opacity = 0.2
+            
+            self._cell_selection_overlay = overlay_name
+            
+            self.lbl_status.setText(f"Highlighting {len(self._selected_cell_ids)} cells")
+            self.lbl_status.setStyleSheet("color: #4CAF50; font-weight: bold;")
+    
+    def _clear_cell_highlight(self):
+        """Remove cell highlight overlay and restore original appearance."""
+        # Remove overlay layer if exists
+        if self._cell_selection_overlay:
+            for layer in list(self.viewer.layers):
+                if layer.name == self._cell_selection_overlay:
+                    self.viewer.layers.remove(layer)
+                    break
+            self._cell_selection_overlay = None
+        
+        # Restore original mask opacity
+        mask_layer = self._get_mask_layer()
+        if mask_layer is not None:
+            mask_layer.opacity = self._original_mask_opacity
+        
+        self.lbl_status.setText("Highlight cleared")
+        self.lbl_status.setStyleSheet("color: gray; font-style: italic;")
     
     def _refresh_grid_mode(self):
         """Refresh grid mode after layer modifications to fix display issues.

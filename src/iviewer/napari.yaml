@@ -25,9 +25,6 @@ contributions:
     - id: iviewer.mask_highlight_widget
       python_name: iviewer.mask_highlight_widget:MaskHighlightWidget
       title: Mask Highlight
-    - id: iviewer.mask_editor_widget
-      python_name: iviewer.mask_editor_widget:MaskEditorWidget
-      title: Mask Editor
     - id: iviewer.rsfish_widget
       python_name: iviewer.rsfish_widget:RSFISHWidget
       title: RS-FISH Spot Detection
@@ -37,7 +34,5 @@ contributions:
       display_name: Layer Groups
     - command: iviewer.mask_highlight_widget
       display_name: Mask Highlight
-    - command: iviewer.mask_editor_widget
-      display_name: Mask Editor
     - command: iviewer.rsfish_widget
       display_name: RS-FISH
