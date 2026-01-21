@@ -105,6 +105,12 @@ class RSFISHWorker(QThread):
                 f"--background={self.params['background']}",
             ]
             
+            # Add min/max intensity if provided (for preview mode)
+            if 'min_intensity' in self.params and self.params['min_intensity'] is not None:
+                cmd.append(f"--minIntensity={self.params['min_intensity']}")
+            if 'max_intensity' in self.params and self.params['max_intensity'] is not None:
+                cmd.append(f"--maxIntensity={self.params['max_intensity']}")
+            
             self.progress.emit(f"Running: {' '.join(cmd)}")
             
             # Run RS-FISH
@@ -626,29 +632,27 @@ class RSFISHWidget(QWidget):
         self.lbl_roi_status.setText(f"ROI: {roi_size} pixels")
         self.lbl_roi_status.setStyleSheet("color: #4CAF50; font-size: 10px;")
         
-        # Calculate threshold scale factor based on intensity range difference
-        # The threshold is relative to intensity, so we need to scale it
-        # when the preview region has a different dynamic range than the full image
+        # Get full image min/max for RS-FISH CLI parameters
+        # This ensures preview uses the same intensity range as the full image
+        min_full = float(data.min())
         max_full = float(data.max())
+        min_preview = float(preview_data.min())
         max_preview = float(preview_data.max())
         
-        if max_preview > 0 and max_full > 0:
-            threshold_scale = max_full / max_preview
-        else:
-            threshold_scale = 1.0
+        # Log for user awareness
+        self.txt_log.append(f"Full image intensity range: [{min_full:.1f}, {max_full:.1f}]")
+        self.txt_log.append(f"Preview intensity range: [{min_preview:.1f}, {max_preview:.1f}]")
+        self.txt_log.append(f"Using full image intensity range for preview detection")
         
-        # Log the scaling for user awareness
-        self.txt_log.append(f"Preview intensity: max={max_preview:.1f}, full image max={max_full:.1f}")
-        self.txt_log.append(f"Threshold scale factor: {threshold_scale:.3f}")
-        
-        # Run detection with offset information and threshold scaling
+        # Run detection with offset information and full image intensity range
         self._run_detection(
             preview_data, 
             is_preview=True, 
             z_offset=z_offset,
             y_offset=y_min,
             x_offset=x_min,
-            threshold_scale=threshold_scale,
+            min_intensity=min_full,
+            max_intensity=max_full,
         )
     
     def _run_full_detection(self):
@@ -672,7 +676,8 @@ class RSFISHWidget(QWidget):
         z_offset: int = 0,
         y_offset: int = 0,
         x_offset: int = 0,
-        threshold_scale: float = 1.0,
+        min_intensity: float = None,
+        max_intensity: float = None,
     ):
         """Run RS-FISH detection on the given data.
         
@@ -688,9 +693,12 @@ class RSFISHWidget(QWidget):
             Y-offset to add to results (for ROI preview)
         x_offset : int
             X-offset to add to results (for ROI preview)
-        threshold_scale : float
-            Scale factor for threshold (used in preview mode to account for
-            different dynamic ranges between full image and preview region)
+        min_intensity : float, optional
+            Minimum intensity value to pass to RS-FISH CLI (for preview mode).
+            When provided, RS-FISH will use this instead of computing from the image.
+        max_intensity : float, optional
+            Maximum intensity value to pass to RS-FISH CLI (for preview mode).
+            When provided, RS-FISH will use this instead of computing from the image.
         """
         # Disable buttons during processing
         self.btn_preview.setEnabled(False)
@@ -717,12 +725,11 @@ class RSFISHWidget(QWidget):
         # Get parameters
         params = self._get_params()
         
-        # Apply threshold scaling for preview mode
-        # This accounts for the different dynamic range between full image and preview region
-        if threshold_scale != 1.0:
-            original_threshold = params['threshold']
-            params['threshold'] = original_threshold * threshold_scale
-            self.txt_log.append(f"Threshold scaled: {original_threshold:.6f} -> {params['threshold']:.6f} (scale={threshold_scale:.3f})")
+        # Add min/max intensity for preview mode
+        if min_intensity is not None:
+            params['min_intensity'] = min_intensity
+        if max_intensity is not None:
+            params['max_intensity'] = max_intensity
         
         # Create and start worker
         self._worker = RSFISHWorker(
